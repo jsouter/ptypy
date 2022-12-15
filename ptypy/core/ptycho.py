@@ -109,6 +109,13 @@ class Ptycho(Base):
     lowlim = 1
     userlevel = 1
 
+    [frames_before_iterate]
+    default = None
+    type = int
+    help = Number of frames to be loaded before reconstruction starts.
+    doc = For streaming data, this parameter determines when to start 
+          engine iterate if waiting for further frames
+
     [dry_run]
     default = False
     help = Dry run switch
@@ -288,6 +295,18 @@ class Ptycho(Base):
     help = Wildcard entry for list of engines to run. See :py:data:`engine`
     doc = The value of engines.*.name is used to choose among the available engines.
 
+    [json_file]
+    default = None
+    type = str
+    help = For debugging, probably should remove this 
+    doc = 
+
+    [start_time]
+    default = 
+    type = float
+    help = For debugging, probably should remove this 
+    doc = 
+
     """
 
     _PREFIX = PTYCHO_PREFIX
@@ -367,6 +386,9 @@ class Ptycho(Base):
             comment='The Ptypy framework',
         )
 
+        self.debug_dict= {}
+        self.debug_dict['iter_info'] = {}
+
         if level >= 1:
             logger.info('\n' + headerline('Ptycho init level 1', 'l'))
             self.init_structures()
@@ -379,6 +401,7 @@ class Ptycho(Base):
         if level >= 4:
             logger.info('\n' + headerline('Ptycho init level 4', 'l'))
             self.init_engine()
+            self.save_debug_info({'state': 'initializing engine'})
         if level >= 5:
             self.run()
             self.finalize()
@@ -512,7 +535,34 @@ class Ptycho(Base):
         # Initialize the model manager. This also initializes the
         # containers.
         self.model = ModelManager(self, self.p.scans)
-    
+
+    def save_debug_info(self, reading: dict, timestamp=None, write=None, benchmarks=True):
+        if not parallel.master:
+            return
+        if write is None:
+            if self.p.json_file is None:
+                return
+            write = True
+        if not timestamp:
+            timestamp = time.time()
+        timestamp -= self.p.start_time
+        if benchmarks:
+            reading['benchmarks'] = {'load': self.benchmark.data_load,
+                                     'init': self.benchmark.engine_init,
+                                     'prepare': self.benchmark.engine_prepare,
+                                     'iterate': self.benchmark.engine_iterate,
+                                     'finalize': self.benchmark.engine_finalize}
+        self.debug_dict['iter_info'][timestamp] = reading
+        if write:
+            try:
+                output = {'start': self.p.start_time, 'readings': self.debug_dict}
+                # print(output)
+                with open(self.p.json_file, "w") as f:
+                    json.dump(output, f)
+            except Exception as e:
+                print(f'couldnt save to json: {e}')
+            
+
     def init_data(self, print_stats=True):
         """
         Called on __init__ if ``level >= 2``.
@@ -522,10 +572,20 @@ class Ptycho(Base):
         """
         # Load the data. This call creates automatically the scan managers,
         # which create the views and the PODs. Sets self.new_data
-        with LogTime(self.p.io.benchmark == 'all') as t:
-            self.new_data = self.model.new_data()
-        if (self.p.io.benchmark == 'all') and parallel.master: self.benchmark.data_load += t.duration
 
+        with LogTime(self.p.io.benchmark == 'all') as t:
+            while self.new_data is None:
+                self.new_data = self.model.new_data()
+            if (self.p.io.benchmark == 'all') and parallel.master: self.benchmark.data_load += t.duration
+        all_diff_views = len(self.diff.V)
+        end_of_scan = any(s.ptyscan.end_of_scan for s in list(self.model.scans.values()))
+        scanpercents = [all_diff_views/scan.ptyscan.num_frames for scan in self.model.scans.values() if scan.ptyscan.num_frames is not None]
+        available = [int(scan.ptyscan.available) for scan in self.model.scans.values() if scan.ptyscan.available is not None]
+        print(available)
+
+
+        self.save_debug_info({'state': 'loading', 'EOS': end_of_scan, 'scancompletion': scanpercents, 
+                              'num_frames': all_diff_views, 'available': available})
         # Print stats
         parallel.barrier()
         if print_stats:
@@ -550,6 +610,7 @@ class Ptycho(Base):
             Set of engine parameters. The created engine is listed as
             *auto00*, *auto01* , etc in ``self.engines``
         """
+
         if epars is not None:
             # Receiving a parameter set means a new engine parameter set
             # needs to be listed in self.p
@@ -646,6 +707,7 @@ class Ptycho(Base):
             ilog_message('%s: initializing engine' %engine.p.name)
             with LogTime(self.p.io.benchmark == 'all') as t:
                 engine.initialize()
+            self.save_debug_info({'state': 'initializing engine'}, benchmarks= True)
             if (self.p.io.benchmark == 'all') and parallel.master: self.benchmark.engine_init += t.duration
 
             # One .prepare() is always executed, as Ptycho may hold data
@@ -653,11 +715,16 @@ class Ptycho(Base):
             self.new_data = [(d.label, d) for d in self.diff.S.values()]
             with LogTime(self.p.io.benchmark == 'all') as t:
                 engine.prepare()
+            self.save_debug_info({'state': 'preparing'}, benchmarks = True)
             if (self.p.io.benchmark == 'all') and parallel.master: self.benchmark.engine_prepare += t.duration
+
 
             # Start the iteration loop
             ilog_streamer('%s: starting engine' %engine.p.name)
+
+            idx = -1
             while not engine.finished:
+                idx += 1
                 # Check for client requests
                 if parallel.master and self.interactor is not None:
                     self.interactor.process_requests()
@@ -665,16 +732,38 @@ class Ptycho(Base):
                 parallel.barrier()
 
                 # Check for new data
+                # load_timestamp = time.time()
                 with LogTime(self.p.io.benchmark == 'all') as t:
                     self.new_data = self.model.new_data()
                 if (self.p.io.benchmark == 'all') and parallel.master: self.benchmark.data_load += t.duration
 
                 # Last minute preparation before a contiguous block of
                 # iterations
+
+                all_diff_views = len(self.diff.V)
+                end_of_scan = any(s.ptyscan.end_of_scan for s in list(self.model.scans.values()))
+                scanpercents = [all_diff_views/scan.ptyscan.num_frames for scan in self.model.scans.values() if scan.ptyscan.num_frames is not None]
+                available = [int(scan.ptyscan.available) for scan in self.model.scans.values() if scan.ptyscan.available is not None]
+
                 if self.new_data:
+                    # self.save_debug_info({'state': 'loading'}, load_timestamp)
+                    # does it make sense to take timestamps before or after a thing is done?
+                    self.save_debug_info({'state': 'loading', 'EOS': end_of_scan, 'scancompletion': scanpercents,
+                                        'num_frames': all_diff_views, 'available': available})
+                        # Check if we have reached the end of the scan
+                    # moved here for benchmarking
                     with LogTime(self.p.io.benchmark == 'all') as t:
                         engine.prepare()
                     if (self.p.io.benchmark == 'all') and parallel.master: self.benchmark.engine_prepare += t.duration
+                    self.save_debug_info({'state': 'preparing', 'EOS': end_of_scan, 'scancompletion': scanpercents,
+                                            'num_frames': all_diff_views, 'available': available})
+
+                # Nr. of currently loaded diffraction views
+                # Keep loading data, unless we have reached minimum nr. of frames or end of scan
+                keep_loading_data = (self.p.frames_before_iterate is not None) and (all_diff_views < self.p.frames_before_iterate)
+                if keep_loading_data and not end_of_scan:
+                    # self.debug_dict[timestamp]['state'] = 'waiting'
+                    continue
 
                 auto_save = self.p.io.autosave
                 if auto_save.active and auto_save.interval > 0:
@@ -684,11 +773,23 @@ class Ptycho(Base):
                         self.save_run(auto, 'dump')
                         self.runtime.last_save = engine.curiter
                         logger.info(headerline())
+                        self.save_debug_info({'autosave': auto})
 
+
+                # If not end of scan, expand total number of iterations
+                # This is to make sure that the specified nr. of iterations is guaranteed once all data is loaded
+                if not end_of_scan:
+                    engine.numiter += engine.p.numiter_contiguous
+
+                # timestamp_before_iteration = time.time()
                 # One iteration
                 with LogTime(self.p.io.benchmark == 'all') as t:
                     engine.iterate()
                 if (self.p.io.benchmark == 'all') and parallel.master: self.benchmark.engine_iterate += t.duration
+
+                ########################
+                # Benchmarking stuff
+                ########################
 
                 # Display runtime information and do saving
                 if parallel.master:
@@ -701,7 +802,15 @@ class Ptycho(Base):
                     logger.info('Errors :: Fourier %.2e, Photons %.2e, '
                                 'Exit %.2e' % tuple(err))
                     ilog_streamer('%(engine)s: Iteration # %(iteration)d/%(numiter)d :: ' %info + 
-                                   'Fourier %.2e, Photons %.2e, Exit %.2e' %tuple(err))
+                                  'Fourier %.2e, Photons %.2e, Exit %.2e' %tuple(err))
+                    self.save_debug_info({'EOS': end_of_scan, 'numiter': engine.numiter, 
+                                                              'curiter': engine.curiter, 'error': float(err[1]),
+                                                              'scancompletion': scanpercents,
+                                                              'state': 'iterating'}, benchmarks = True)
+
+
+
+
 
                 parallel.barrier()
 
